@@ -170,7 +170,7 @@ def detect_faces_batch(
     conf: float = 0.25,
     imgsz: int = 960,
     half: bool = True,
-    batch: int = 16,
+    batch: int = 64,
 ) -> List[Optional[Image.Image]]:
     """frames_rgb -> list of PIL face crops (or None)"""
     if len(frames_rgb) == 0:
@@ -643,9 +643,10 @@ def main() -> None:
     # Perf controls
     st.sidebar.divider()
     st.sidebar.subheader("⚙️ Производительность")
-    use_gpu = st.sidebar.checkbox("Использовать GPU (CUDA)", value=torch.cuda.is_available())
-    use_fp16 = st.sidebar.checkbox("FP16/AMP", value=True)
-    batch_size = st.sidebar.slider("Batch size", 4, 64, 16, step=4)
+    use_gpu = torch.cuda.is_available()
+    use_fp16 = use_gpu
+    # batch_size = st.sidebar.slider("Batch size", 4, 64, 16, step=4)
+    batch_size = 64  # Set to 64 for better performance
     # yolo_imgsz = st.sidebar.select_slider("YOLO img size", options=[640, 768, 896, 960, 1024, 1280], value=960)
     # yolo_conf = st.sidebar.slider("YOLO conf", 0.10, 0.60, 0.25, step=0.05)
     yolo_imgsz = 1280
@@ -669,8 +670,8 @@ def main() -> None:
         "Surprise": "Удивление",
         "Neutral": "Нейтрально",
     }
-    emotion_list = [f"{e} ({emotion_translations.get(e, '')})" for e in EMOTION_OPTIONS]
-    st.sidebar.info("**Эмоции:**\n" + ", ".join(emotion_list))
+    emotion_list = [f"- **{e}** — {emotion_translations.get(e, '')}" for e in EMOTION_OPTIONS]
+    st.sidebar.markdown("**Эмоции:**\n\n" + "\n".join(emotion_list))
 
     page = st.session_state.get(STATE["page"], PAGES["processing"])
     if page == PAGES["processing"]:
