@@ -112,6 +112,34 @@ def load_models(use_gpu: bool = True, use_fp16: bool = True) -> Optional[ModelBu
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Helpers for CSV naming & autosave (NEW)
+# ──────────────────────────────────────────────────────────────────────────────
+def get_video_csv_path() -> str:
+    """Return the canonical CSV path derived from the current video name in tmp dir.
+    Example: /tmp/<video_stem>.csv
+    """
+    video_path = st.session_state.get(STATE["video"]) or ""
+    video_name = Path(video_path).stem if video_path else "results"
+    return str(Path(tempfile.gettempdir()) / f"{video_name}.csv")
+
+
+def autosave_review_df(df: pd.DataFrame) -> None:
+    """Persist current review DataFrame to canonical CSV path and keep session in sync."""
+    csv_path = st.session_state.get(STATE["csv"]) or get_video_csv_path()
+    try:
+        df.to_csv(csv_path, index=False)
+        st.session_state[STATE["csv"]] = csv_path
+        st.session_state[STATE["review_df"]] = df
+        # Optional lightweight toast; safe if Streamlit supports it
+        try:
+            st.toast(f"Автосохранение: {Path(csv_path).name}")
+        except Exception:
+            pass
+    except Exception as e:
+        st.warning(f"Не удалось сохранить CSV: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Video utilities
 # ──────────────────────────────────────────────────────────────────────────────
 def get_video_info(video_path: str) -> Tuple[float, int, float, int, int]:
@@ -428,11 +456,9 @@ def page_processing(perf_opts: dict) -> None:
                     conf=perf_opts["yolo_conf"],
                     progress_cb=pbar.progress,
                 )
-                # Save CSV temp for review page
-                video_path = st.session_state[STATE["video"]]
-                video_name = Path(video_path).stem
-                csv_name = f"{video_name}.csv"
-                csv_path = str(Path(tempfile.gettempdir()) / csv_name)
+                # Save CSV temp for review page — ensure name equals video stem
+                video_name = Path(uploaded_file.name).stem
+                csv_path = str(Path(tempfile.gettempdir()) / f"{video_name}.csv")
                 df.to_csv(csv_path, index=False)
                 st.session_state[STATE["csv"]] = csv_path
 
@@ -451,7 +477,7 @@ def page_processing(perf_opts: dict) -> None:
                 st.download_button(
                     label="📥 Скачать CSV",
                     data=buf.getvalue(),
-                    file_name=csv_name,
+                    file_name=f"{video_name}.csv",
                     mime="text/csv",
                 )
 
@@ -467,6 +493,7 @@ def page_processing(perf_opts: dict) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # UI: Review page
 # ──────────────────────────────────────────────────────────────────────────────
+
 def ensure_review_df() -> Optional[pd.DataFrame]:
     csv_path = st.session_state.get(STATE["csv"])
     if not csv_path:
@@ -479,6 +506,8 @@ def ensure_review_df() -> Optional[pd.DataFrame]:
         base["reviewed_emotion_to"] = ""
         base["comment"] = ""
         st.session_state[STATE["review_df"]] = base
+        # Persist immediately so the CSV on disk mirrors the review schema
+        autosave_review_df(base)
     return st.session_state[STATE["review_df"]]
 
 
@@ -491,6 +520,10 @@ def page_review() -> None:
             st.session_state[STATE["page"]] = PAGES["processing"]
             st.rerun()
         return
+
+    csv_path = st.session_state[STATE["csv"]]
+    csv_name = Path(csv_path).name
+    st.caption(f"Автосохранение включено → {csv_name}")
 
     df = ensure_review_df()
     if df is None or df.empty:
@@ -540,14 +573,14 @@ def page_review() -> None:
     with b1:
         if st.button("✅ Одобрить", type="primary", use_container_width=True):
             df.loc[idx, "review"] = "approved"
-            st.session_state[STATE["review_df"]] = df
+            autosave_review_df(df)
             if idx < len(df) - 1:
                 st.session_state[STATE["idx"]] = idx + 1
             st.rerun()
     with b2:
         if st.button("❌ Отклонить", use_container_width=True):
             df.loc[idx, "review"] = "rejected"
-            st.session_state[STATE["review_df"]] = df
+            autosave_review_df(df)
             st.session_state[STATE["show_corr"]] = True
             st.rerun()
 
@@ -575,9 +608,9 @@ def page_review() -> None:
             df.loc[idx, "reviewed_emotion_from"] = corrected_from
             df.loc[idx, "reviewed_emotion_to"] = corrected_to
             df.loc[idx, "comment"] = comment
-            st.session_state[STATE["review_df"]] = df
+            autosave_review_df(df)
             st.session_state[STATE["show_corr"]] = False
-            st.success("Исправление сохранено!")
+            st.success("Исправление сохранено и CSV обновлён!")
             if idx < len(df) - 1:
                 st.session_state[STATE["idx"]] = idx + 1
             st.rerun()
@@ -612,21 +645,26 @@ def page_review() -> None:
     c2.metric("❌ Отклонено", rejected)
     c3.metric("⏳ В ожидании", pending)
 
+    # Always export current in-memory dataframe; filename derived from video name
     buf = io.StringIO()
-    df.to_csv(buf, index=False)
+    st.session_state[STATE["review_df"]].to_csv(buf, index=False)
     st.download_button(
         label="📥 Экспортировать итоговый CSV",
         data=buf.getvalue(),
-        file_name="reviewed_emotion_transitions.csv",
+        file_name=Path(csv_path).name,
         mime="text/csv",
         type="primary",
     )
 
+    # Optional: notify when all reviews are finished
+    if pending == 0:
+        st.success(f"Все проверки завершены! Итог сохранён в {Path(csv_path).name}.")
+
     if st.button("← Назад к обработке"):
-        st.session_state[STATE]["page"] = PAGES["processing"]
-        st.session_state[STATE]["csv"] = None
-        st.session_state[STATE]["review_df"] = None
-        st.session_state[STATE]["idx"] = 0
+        st.session_state[STATE["page"]] = PAGES["processing"]  # fixed key usage
+        st.session_state[STATE["csv"]] = None
+        st.session_state[STATE["review_df"]] = None
+        st.session_state[STATE["idx"]] = 0
         st.rerun()
 
 
@@ -659,7 +697,6 @@ def main() -> None:
         "yolo_conf": yolo_conf,
     }
 
-    # Add emotion list info to sidebar
     # Add emotion list info to sidebar with Russian translations
     emotion_translations = {
         "Angry": "Злость",
