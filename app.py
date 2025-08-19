@@ -3,7 +3,7 @@ import io
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -25,14 +25,13 @@ st.set_page_config(page_title="Video Emotion Percentage Analysis", page_icon="�
 # ──────────────────────────────────────────────────────────────────────────────
 EMOTION_OPTIONS: List[str] = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
 EMOTION_TRANSLATIONS = {
-    "angry": "злость",
-    "disgust": "отвращение",
-    "fear": "страх",
-    "happy": "счастье",
-    "sad": "грусть",
-    "surprise": "удивление",
-    "neutral": "нейтрально",
-    "no_face": "лицо не найдено",
+    "angry": "Злость",
+    "disgust": "Отвращение",
+    "fear": "Страх",
+    "happy": "Счастье",
+    "sad": "Грусть",
+    "surprise": "Удивление",
+    "neutral": "Нейтрально",
 }
 
 # Simplified session state keys
@@ -79,7 +78,6 @@ def load_models(use_gpu: bool = True, use_fp16: bool = True) -> Optional[ModelBu
     """
     device = get_device(use_gpu)
 
-    # Performance optimizations for CUDA
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.allow_tf32 = True
@@ -87,15 +85,13 @@ def load_models(use_gpu: bool = True, use_fp16: bool = True) -> Optional[ModelBu
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.set_float32_matmul_precision("high")
         except AttributeError:
-            pass  # For older PyTorch versions
+            pass
 
     try:
-        # Load YOLO face detection model
         yolo = YOLO("models/yolov8n-face.pt")
         yolo.to("cuda" if device.type == "cuda" else "cpu")
-        yolo.fuse()  # Speeds up inference
+        yolo.fuse()
 
-        # Load Hugging Face expression classifier model
         model_name = "trpakov/vit-face-expression"
         processor = AutoImageProcessor.from_pretrained(model_name)
         expr_model = AutoModelForImageClassification.from_pretrained(model_name).to(device).eval()
@@ -156,13 +152,7 @@ def _crop_face_from_result(frame_rgb: np.ndarray, box_xyxy: np.ndarray, expand_r
 
 
 def detect_faces_batch(
-    yolo_model: YOLO,
-    frames_rgb: List[np.ndarray],
-    device: torch.device,
-    conf: float,
-    imgsz: int,
-    half: bool,
-    batch_size: int,
+    yolo_model: YOLO, frames_rgb: List[np.ndarray], device: torch.device, conf: float, imgsz: int, half: bool, batch_size: int
 ) -> List[Optional[Image.Image]]:
     """Detects the most prominent face in a batch of frames."""
     if not frames_rgb:
@@ -170,14 +160,7 @@ def detect_faces_batch(
 
     ultra_device = 0 if device.type == "cuda" else "cpu"
     results = yolo_model.predict(
-        source=frames_rgb,
-        conf=conf,
-        imgsz=imgsz,
-        max_det=1,
-        device=ultra_device,
-        half=half,
-        verbose=False,
-        batch=batch_size,
+        source=frames_rgb, conf=conf, imgsz=imgsz, max_det=1, device=ultra_device, half=half, verbose=False, batch=batch_size
     )
 
     faces: List[Optional[Image.Image]] = []
@@ -191,16 +174,12 @@ def detect_faces_batch(
 
 
 def predict_expressions_batch(
-    processor: AutoImageProcessor,
-    expr_model: AutoModelForImageClassification,
-    faces: List[Optional[Image.Image]],
-    device: torch.device,
-    amp_dtype: Optional[torch.dtype],
-) -> List[str]:
-    """Predicts emotions for a batch of face crops."""
+    processor: AutoImageProcessor, expr_model: AutoModelForImageClassification, faces: List[Optional[Image.Image]], device: torch.device, amp_dtype: Optional[torch.dtype]
+) -> List[Optional[Dict[str, float]]]:
+    """Predicts emotion probabilities for a batch of face crops."""
     valid_faces = [img for img in faces if img is not None]
     if not valid_faces:
-        return ["no_face"] * len(faces)
+        return [None] * len(faces)
 
     inputs = processor(images=valid_faces, return_tensors="pt").to(device)
 
@@ -211,32 +190,30 @@ def predict_expressions_batch(
         else:
             logits = expr_model(**inputs).logits
 
-    preds = logits.argmax(dim=-1).cpu().tolist()
-    labels = [expr_model.config.id2label[p] for p in preds]
+    # Use softmax to get probabilities for all emotions
+    probabilities = torch.nn.functional.softmax(logits, dim=-1)
+    
+    labels = expr_model.config.id2label
+    results_list = []
+    for prob_tensor in probabilities:
+        prob_dict = {labels[i]: p.item() * 100 for i, p in enumerate(prob_tensor)}
+        results_list.append(prob_dict)
 
-    # Re-insert "no_face" for frames where no face was detected
-    result_iter = iter(labels)
-    return [next(result_iter) if face else "no_face" for face in faces]
+    # Re-insert None for frames where no face was detected
+    result_iter = iter(results_list)
+    return [next(result_iter) if face else None for face in faces]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Core Processing Logic
 # ──────────────────────────────────────────────────────────────────────────────
 def _run_batch(
-    times_batch: List[float],
-    frames_batch: List[np.ndarray],
-    models: ModelBundle,
-    params: dict,
-) -> List[Tuple[float, str]]:
+    times_batch: List[float], frames_batch: List[np.ndarray], models: ModelBundle, params: dict
+) -> List[Tuple[float, Optional[Dict[str, float]]]]:
     """Processes a single batch of frames for face detection and emotion classification."""
     faces = detect_faces_batch(
-        models.yolo,
-        frames_batch,
-        models.device,
-        conf=params["yolo_conf"],
-        imgsz=params["yolo_imgsz"],
-        half=(models.amp_dtype is torch.float16),
-        batch_size=params["batch_size"],
+        models.yolo, frames_batch, models.device, conf=params["yolo_conf"], imgsz=params["yolo_imgsz"],
+        half=(models.amp_dtype is torch.float16), batch_size=params["batch_size"]
     )
     emotions = predict_expressions_batch(
         models.processor, models.expr_model, faces, models.device, models.amp_dtype
@@ -245,25 +222,20 @@ def _run_batch(
 
 
 def process_video(
-    video_path: str,
-    models: ModelBundle,
-    params: dict,
-    progress_cb: callable,
+    video_path: str, models: ModelBundle, params: dict, progress_cb: callable
 ) -> pd.DataFrame:
     """
-    Analyzes the entire video to calculate the duration and percentage of each emotion.
-
-    Returns a DataFrame with columns: ['Emotion', 'Duration (s)', 'Percentage (%)'].
+    Analyzes the video to get emotion probabilities at each step.
+    Returns a DataFrame with columns: ['Timestamp (s)', 'angry', 'disgust', ...].
     """
-    fps, frame_count, duration = get_video_info(video_path)
+    fps, _, duration = get_video_info(video_path)
     if duration == 0:
         raise ValueError("Видео имеет нулевую длительность или не может быть прочитано.")
 
     step_sec = 1.0  # Analyze one frame per second
     total_steps = max(1, int(np.ceil(duration / step_sec)))
     
-    # Process video in batches
-    per_step_emotions: List[Tuple[float, str]] = []
+    all_results: List[Tuple[float, Optional[Dict[str, float]]]] = []
     times_buf, frames_buf = [], []
 
     frame_iterator = iterate_frames(video_path, fps, duration, step_sec)
@@ -272,45 +244,36 @@ def process_video(
         frames_buf.append(frame_rgb)
 
         if len(frames_buf) >= params["batch_size"]:
-            per_step_emotions.extend(_run_batch(times_buf, frames_buf, models, params))
+            all_results.extend(_run_batch(times_buf, frames_buf, models, params))
             times_buf.clear()
             frames_buf.clear()
             progress_cb(min((i + 1) / total_steps, 1.0))
 
-    # Process any remaining frames
     if frames_buf:
-        per_step_emotions.extend(_run_batch(times_buf, frames_buf, models, params))
+        all_results.extend(_run_batch(times_buf, frames_buf, models, params))
         progress_cb(1.0)
     
-    # Calculate durations
-    emotion_durations = {emotion: 0.0 for emotion in EMOTION_OPTIONS + ["no_face"]}
-    if not per_step_emotions:
-        return pd.DataFrame(columns=["Emotion", "Duration (s)", "Percentage (%)"])
+    if not all_results:
+        return pd.DataFrame()
 
-    per_step_emotions.sort(key=lambda x: x[0])
-
-    for i in range(len(per_step_emotions) - 1):
-        time_start, emotion = per_step_emotions[i]
-        time_end = per_step_emotions[i+1][0]
-        emotion_durations[emotion] += (time_end - time_start)
-
-    # Add duration of the last segment
-    last_time, last_emotion = per_step_emotions[-1]
-    emotion_durations[last_emotion] += (duration - last_time)
-
-    # Create summary DataFrame
-    summary = []
-    for emotion, total_time in emotion_durations.items():
-        if total_time > 0:
-            percentage = (total_time / duration) * 100
-            summary.append({
-                "Emotion": EMOTION_TRANSLATIONS.get(emotion, emotion),
-                "Duration (s)": round(total_time, 2),
-                "Percentage (%)": round(percentage, 2),
-            })
+    records = []
+    for timestamp, emotions_dict in all_results:
+        record = {"Timestamp (s)": round(timestamp, 2)}
+        if emotions_dict:
+            for emotion, percentage in emotions_dict.items():
+                record[emotion] = round(percentage, 2)
+        else: # Fill with 0 if no face is detected
+            for emotion in EMOTION_OPTIONS:
+                record[emotion] = 0.0
+        records.append(record)
     
-    df = pd.DataFrame(summary).sort_values(by="Percentage (%)", ascending=False).reset_index(drop=True)
-    return df
+    df = pd.DataFrame(records)
+    
+    for emotion in EMOTION_OPTIONS: # Ensure all emotion columns exist
+        if emotion not in df.columns:
+            df[emotion] = 0.0
+            
+    return df[["Timestamp (s)"] + EMOTION_OPTIONS]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -319,9 +282,8 @@ def process_video(
 def main():
     """Main function to run the Streamlit application."""
     st.title("📊 Анализ процентного соотношения эмоций на видео")
-    st.markdown("Загрузите видеофайл, чтобы определить, сколько времени каждая эмоция присутствовала на лице.")
+    st.markdown("Загрузите видеофайл, чтобы увидеть динамику эмоций с течением времени.")
 
-    # --- Sidebar Controls ---
     with st.sidebar:
         st.title("⚙️ Настройки")
         st.subheader("Параметры производительности")
@@ -329,11 +291,11 @@ def main():
         use_gpu = torch.cuda.is_available()
         use_fp16 = use_gpu
         
-        st.info(f"Доступен GPU: {'Да' if use_gpu else 'Нет'}. Обработка будет на **{'GPU' if use_gpu else 'CPU'}**.")
+        st.info(f"Доступен GPU: {'Да' if use_gpu else 'Нет'}. Обработка на **{'GPU' if use_gpu else 'CPU'}**.")
 
-        batch_size = st.slider("Размер пакета (Batch Size)", 4, 128, 64, step=4, help="Больше значение — быстрее обработка на GPU, но требует больше видеопамяти.")
-        yolo_imgsz = st.select_slider("Размер изображения YOLO", options=[640, 960, 1280], value=960, help="Больший размер может повысить точность обнаружения лиц, но замедляет обработку.")
-        yolo_conf = st.slider("Порог уверенности YOLO", 0.10, 0.50, 0.25, step=0.05, help="Минимальная уверенность для обнаружения лица.")
+        batch_size = st.slider("Размер пакета (Batch Size)", 4, 128, 64, step=4)
+        yolo_imgsz = st.select_slider("Размер изображения YOLO", options=[640, 960, 1280], value=960)
+        yolo_conf = st.slider("Порог уверенности YOLO", 0.10, 0.50, 0.25, step=0.05)
         
         perf_params = {
             "use_gpu": use_gpu, "use_fp16": use_fp16, "batch_size": batch_size,
@@ -345,15 +307,12 @@ def main():
         emotion_list = [f"- **{EMOTION_TRANSLATIONS.get(e)}** ({e})" for e in EMOTION_OPTIONS]
         st.markdown("\n".join(emotion_list))
 
-    # --- Main Page Content ---
     uploaded_file = st.file_uploader(
-        "Выберите видеофайл",
-        type=["mp4", "mov", "avi", "mkv"],
-        on_change=lambda: st.session_state.update({STATE["results_df"]: None, STATE["video_path"]: None}),
+        "Выберите видеофайл", type=["mp4", "mov", "avi", "mkv"],
+        on_change=lambda: st.session_state.update({STATE["results_df"]: None, STATE["video_path"]: None})
     )
 
     if uploaded_file is not None:
-        # Save uploaded file to a temporary path
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
             tmp_file.write(uploaded_file.getvalue())
             st.session_state[STATE["video_path"]] = tmp_file.name
@@ -371,10 +330,8 @@ def main():
                 progress_bar = st.progress(0, text="Инициализация...")
                 try:
                     df = process_video(
-                        video_path=st.session_state[STATE["video_path"]],
-                        models=models,
-                        params=perf_params,
-                        progress_cb=lambda p: progress_bar.progress(p, text=f"Обработка... {int(p*100)}%"),
+                        video_path=st.session_state[STATE["video_path"]], models=models, params=perf_params,
+                        progress_cb=lambda p: progress_bar.progress(p, text=f"Обработка... {int(p*100)}%")
                     )
                     st.session_state[STATE["results_df"]] = df
                     progress_bar.empty()
@@ -382,34 +339,53 @@ def main():
                     st.error(f"Произошла ошибка при обработке: {e}")
                     progress_bar.empty()
 
-    # --- Display Results ---
     if st.session_state[STATE["results_df"]] is not None:
         st.divider()
         st.subheader("📈 Результаты анализа")
-        results_df = st.session_state[STATE["results_df"]]
+        time_series_df = st.session_state[STATE["results_df"]]
 
-        if results_df.empty:
+        if time_series_df.empty or time_series_df.drop("Timestamp (s)", axis=1).sum().sum() == 0:
             st.warning("Не удалось обнаружить эмоции в видео. Возможно, на видео нет лиц.")
         else:
-            # Prepare data for charting (ensure consistent column names)
-            chart_data = results_df.rename(columns={"Percentage (%)": "Percentage"})
-            chart_data = chart_data.set_index("Emotion")
+            # --- 1. Summary: Average percentages ---
+            st.write("#### Сводка: Средний процент эмоций")
+            st.info("Средние значения рассчитаны только для тех моментов, когда было обнаружено лицо.")
+            
+            emotion_cols = time_series_df[EMOTION_OPTIONS]
+            valid_frames = emotion_cols.sum(axis=1) > 1 # Sum > 1 to be safe with float precision
+            
+            avg_emotions = emotion_cols[valid_frames].mean() if valid_frames.any() else pd.Series(0.0, index=EMOTION_OPTIONS)
 
-            st.bar_chart(chart_data["Percentage"])
+            summary_df = pd.DataFrame({
+                "Эмоция": [EMOTION_TRANSLATIONS.get(e, e) for e in avg_emotions.index],
+                "Средний процент (%)": avg_emotions.values.round(2)
+            }).sort_values(by="Средний процент (%)", ascending=False).reset_index(drop=True)
 
-            st.dataframe(results_df, use_container_width=True)
+            chart_data = summary_df.rename(columns={"Средний процент (%)": "Процент"}).set_index("Эмоция")
+            st.bar_chart(chart_data["Процент"])
+            st.dataframe(summary_df, use_container_width=True)
 
-            # Create CSV for download
+            # --- 2. Time-series chart and data ---
+            st.divider()
+            st.write("#### Динамика эмоций во времени")
+            
+            chart_df = time_series_df.set_index("Timestamp (s)")
+            chart_df.columns = [EMOTION_TRANSLATIONS.get(col, col) for col in chart_df.columns]
+            st.line_chart(chart_df)
+            
+            st.write("#### Детальные данные по времени (в процентах)")
+            display_df = time_series_df.copy()
+            display_df.columns = ["Timestamp (s)"] + [EMOTION_TRANSLATIONS.get(e, e) for e in EMOTION_OPTIONS]
+            st.dataframe(display_df, use_container_width=True)
+
+            # --- 3. CSV Download ---
             csv_buffer = io.StringIO()
-            results_df.to_csv(csv_buffer, index=False, encoding="utf-8")
+            display_df.to_csv(csv_buffer, index=False, encoding="utf-8-sig")
             
             video_name = Path(uploaded_file.name).stem
             st.download_button(
-                label="📥 Скачать результаты (CSV)",
-                data=csv_buffer.getvalue(),
-                file_name=f"{video_name}_emotion_analysis.csv",
-                mime="text/csv",
-                type="primary"
+                label="📥 Скачать детальные результаты (CSV)", data=csv_buffer.getvalue(),
+                file_name=f"{video_name}_emotion_time_series.csv", mime="text/csv", type="primary"
             )
 
 if __name__ == "__main__":
