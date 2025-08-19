@@ -1,6 +1,12 @@
-ultralytics
-transformers
-streamlit
-opencv-python
+numpy
 pandas
-Pillow
+opencv-python # cv2
+Pillow # PIL
+
+# Streamlit application framework
+streamlit
+
+# Machine learning and computer vision
+torch
+ultralytics # YOLO
+transformers
