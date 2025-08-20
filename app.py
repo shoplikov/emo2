@@ -92,7 +92,8 @@ def load_models(use_gpu: bool = True, use_fp16: bool = True) -> Optional[ModelBu
         yolo.to("cuda" if device.type == "cuda" else "cpu")
         yolo.fuse()
 
-        model_name = "trpakov/vit-face-expression"
+        # model_name = "trpakov/vit-face-expression"
+        model_name = "mo-thecreator/vit-Facial-Expression-Recognition"
         processor = AutoImageProcessor.from_pretrained(model_name)
         expr_model = AutoModelForImageClassification.from_pretrained(model_name).to(device).eval()
 
